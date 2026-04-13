@@ -32,7 +32,7 @@ jobs:
       - name: Install tools
         run: |
           echo "::group::Installing coldsnap and qemu"
-          nix profile install nixpkgs#coldsnap nixpkgs#qemu
+          nix profile install nixpkgs#coldsnap nixpkgs#qemu nixpkgs#iperf3 nixpkgs#traceroute nixpkgs#mtr
           echo "::endgroup::"
           coldsnap --help | head -1
           qemu-img --version | head -1
@@ -45,38 +45,176 @@ jobs:
           qemu-img convert -O raw "$image_file" /tmp/nixos-test.raw
           echo "Raw image:"
           ls -lh /tmp/nixos-test.raw
-      - name: Network diagnostics
+          stat -c "Exact bytes: %s" /tmp/nixos-test.raw
+
+      # ========== DIAGNOSTICS ==========
+
+      - name: Runner environment
         run: |
-          echo "=== Runner info ==="
+          echo "=== System ==="
           uname -a
+          cat /etc/os-release | head -5
+          echo ""
+          echo "=== CPU ==="
           nproc
-          free -h | head -2
+          lscpu | grep -E "Model name|CPU MHz|CPU\(s\)|Thread|Core|Socket|Virtualization|Hypervisor"
           echo ""
-          echo "=== Network to EBS endpoint ==="
-          curl -so /dev/null -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTLS: %{time_appconnect}s\nTotal: %{time_total}s\nHTTP code: %{http_code}\n" https://ebs.us-east-1.amazonaws.com/ || true
+          echo "=== Memory ==="
+          free -h
           echo ""
-          echo "=== Network to S3 (for comparison) ==="
-          curl -so /dev/null -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTLS: %{time_appconnect}s\nTotal: %{time_total}s\nHTTP code: %{http_code}\n" https://s3.us-east-1.amazonaws.com/ || true
+          echo "=== Disk ==="
+          df -h /tmp
           echo ""
-          echo "=== Bandwidth test (download 100MB from S3) ==="
-          time curl -so /dev/null https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz || true
+          echo "=== Disk IO benchmark (4G sequential read) ==="
+          dd if=/tmp/nixos-test.raw of=/dev/null bs=1M count=4096 2>&1
+          echo ""
+          echo "=== Disk IO benchmark (4G sequential read, second run / cached) ==="
+          dd if=/tmp/nixos-test.raw of=/dev/null bs=1M count=4096 2>&1
+
+      - name: Network identity
+        run: |
+          echo "=== Public IP ==="
+          curl -s https://ifconfig.me && echo ""
+          echo ""
+          echo "=== IP info ==="
+          curl -s https://ipinfo.io | jq '.' || curl -s https://ipinfo.io
+          echo ""
+          echo "=== DNS resolvers ==="
+          cat /etc/resolv.conf
+          echo ""
+          echo "=== Route to EBS endpoint ==="
+          traceroute -n -m 20 -w 2 ebs.us-east-1.amazonaws.com 2>&1 | head -25 || true
+          echo ""
+          echo "=== Route to S3 endpoint (comparison) ==="
+          traceroute -n -m 20 -w 2 s3.us-east-1.amazonaws.com 2>&1 | head -25 || true
+
+      - name: DNS resolution timing
+        run: |
+          echo "=== EBS endpoint DNS ==="
+          for i in 1 2 3 4 5; do
+            dig +stats ebs.us-east-1.amazonaws.com 2>&1 | grep -E "Query time|SERVER|ANSWER SECTION" -A1
+            echo "---"
+          done
+          echo ""
+          echo "=== S3 endpoint DNS ==="
+          for i in 1 2 3; do
+            dig +stats s3.us-east-1.amazonaws.com 2>&1 | grep -E "Query time|SERVER|ANSWER SECTION" -A1
+            echo "---"
+          done
+          echo ""
+          echo "=== EBS resolved IPs ==="
+          dig +short ebs.us-east-1.amazonaws.com
+          echo ""
+          echo "=== S3 resolved IPs ==="
+          dig +short s3.us-east-1.amazonaws.com
+
+      - name: HTTPS connection benchmarks
+        run: |
+          echo "=== EBS endpoint (5 requests) ==="
+          for i in 1 2 3 4 5; do
+            echo -n "Request $i: "
+            curl -so /dev/null -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total} http=%{http_code}" https://ebs.us-east-1.amazonaws.com/ 2>/dev/null || echo "FAILED"
+            echo ""
+          done
+          echo ""
+          echo "=== S3 endpoint (5 requests) ==="
+          for i in 1 2 3 4 5; do
+            echo -n "Request $i: "
+            curl -so /dev/null -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total} http=%{http_code}" https://s3.us-east-1.amazonaws.com/ 2>/dev/null || echo "FAILED"
+            echo ""
+          done
+          echo ""
+          echo "=== EC2 endpoint (5 requests) ==="
+          for i in 1 2 3 4 5; do
+            echo -n "Request $i: "
+            curl -so /dev/null -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total} http=%{http_code}" https://ec2.us-east-1.amazonaws.com/ 2>/dev/null || echo "FAILED"
+            echo ""
+          done
+
+      - name: Bandwidth tests
+        run: |
+          echo "=== Download bandwidth (kernel.org CDN, ~130MB) ==="
+          curl -so /dev/null -w "Speed: %{speed_download} bytes/sec\nTotal: %{time_total}s\nSize: %{size_download} bytes\n" https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz || true
+          echo ""
+          echo "=== Upload bandwidth to S3 (PUT 100MB of zeros, presigned not available so skip) ==="
+          echo "(S3 upload test skipped — would need a bucket)"
+          echo ""
+          echo "=== Upload bandwidth estimate: PUT to EBS via single large curl ==="
+          echo "(Testing raw HTTPS PUT throughput to EBS endpoint region)"
+          dd if=/dev/zero bs=1M count=100 2>/dev/null | curl -so /dev/null -w "Speed: %{speed_upload} bytes/sec\nTotal: %{time_total}s\n" -X PUT -d @- https://ebs.us-east-1.amazonaws.com/ 2>/dev/null || echo "(Expected to fail — just measuring connection behavior)"
+
+      - name: TCP connection behavior
+        run: |
+          echo "=== Max concurrent connections to EBS endpoint ==="
+          echo "Opening 50 concurrent TLS connections..."
+          for i in $(seq 1 50); do
+            (curl -so /dev/null -w "$i:%{time_connect}:%{time_appconnect}:%{http_code}\n" --max-time 10 https://ebs.us-east-1.amazonaws.com/ 2>/dev/null || echo "$i:FAIL") &
+          done
+          wait
+          echo ""
+          echo "=== Connection reuse test (10 sequential to same endpoint) ==="
+          curl -so /dev/null -w "1: total=%{time_total}\n" https://ebs.us-east-1.amazonaws.com/ 2>/dev/null || true
+          for i in $(seq 2 10); do
+            curl -so /dev/null -w "$i: total=%{time_total}\n" https://ebs.us-east-1.amazonaws.com/ 2>/dev/null || true
+          done
+
+      - name: System resource baseline
+        run: |
+          echo "=== CPU usage ==="
+          mpstat 1 3 2>/dev/null || top -bn1 | head -5
+          echo ""
+          echo "=== IO stats ==="
+          iostat -x 1 3 2>/dev/null || true
+          echo ""
+          echo "=== Network interfaces ==="
+          ip addr show | grep -E "inet |mtu|state"
+          echo ""
+          echo "=== Network stats ==="
+          ss -s
+          echo ""
+          echo "=== iptables/nftables (any egress rules?) ==="
+          sudo iptables -L OUTPUT -n 2>/dev/null | head -20 || true
+          sudo nft list ruleset 2>/dev/null | head -30 || true
+
+      # ========== COLDSNAP UPLOADS ==========
+
       - name: Coldsnap upload - run 1
         timeout-minutes: 15
         run: |
           echo "=== Starting coldsnap upload run 1 at $(date -u) ==="
-          export RUST_LOG=coldsnap=debug
+          export RUST_LOG=coldsnap=debug,aws_smithy_client=debug,aws_sdk_ebs=debug
+
+          # Capture system stats during upload
+          vmstat 5 > /tmp/vmstat-run1.log 2>&1 &
+          VMSTAT_PID=$!
+          iostat -x 5 > /tmp/iostat-run1.log 2>&1 &
+          IOSTAT_PID=$!
+          # Monitor network bytes every 5s
+          bash -c 'while true; do echo "$(date -u) $(cat /proc/net/dev | grep eth0)"; sleep 5; done' > /tmp/netstat-run1.log 2>&1 &
+          NET_PID=$!
+          # Monitor open connections to EBS
+          bash -c 'while true; do echo "$(date -u) connections=$(ss -tn state established dst ebs.us-east-1.amazonaws.com 2>/dev/null | tail -n+2 | wc -l)"; sleep 5; done' > /tmp/conns-run1.log 2>&1 &
+          CONN_PID=$!
+
           start=$SECONDS
-          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run1.log &
+          coldsnap upload /tmp/nixos-test.raw 2>/tmp/coldsnap-stderr-run1.log | tee /tmp/coldsnap-run1.log &
           PID=$!
-          # Print a heartbeat every 30s so we know it's alive
+
           while kill -0 $PID 2>/dev/null; do
-            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
-            sleep 30
+            elapsed=$(( SECONDS - start ))
+            conns=$(ss -tn state established 2>/dev/null | grep -c "amazonaws" || echo "?")
+            cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+            echo "[$(date -u)] ${elapsed}s elapsed | connections=$conns | cpu=${cpu}%"
+            sleep 15
           done
+
           wait $PID
           STATUS=$?
           elapsed=$(( SECONDS - start ))
           snap_id=$(tail -1 /tmp/coldsnap-run1.log)
+
+          kill $VMSTAT_PID $IOSTAT_PID $NET_PID $CONN_PID 2>/dev/null || true
+
           echo ""
           echo "=== Run 1 complete ==="
           echo "Exit code: $STATUS"
@@ -86,24 +224,55 @@ jobs:
             raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
             throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
             echo "Throughput: ~${throughput} MB/s"
+          fi
+          echo ""
+          echo "=== Coldsnap stderr (debug logs) ==="
+          head -100 /tmp/coldsnap-stderr-run1.log 2>/dev/null || echo "(empty)"
+          echo "..."
+          tail -50 /tmp/coldsnap-stderr-run1.log 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== Network activity during upload ==="
+          cat /tmp/netstat-run1.log 2>/dev/null | head -30 || echo "(empty)"
+          echo ""
+          echo "=== Connections during upload ==="
+          cat /tmp/conns-run1.log 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== VM stats during upload ==="
+          cat /tmp/vmstat-run1.log 2>/dev/null | head -30 || echo "(empty)"
+
+          if [ $STATUS -eq 0 ]; then
             aws ec2 delete-snapshot --snapshot-id "$snap_id"
           fi
+
       - name: Coldsnap upload - run 2
         timeout-minutes: 15
         run: |
           echo "=== Starting coldsnap upload run 2 at $(date -u) ==="
-          export RUST_LOG=coldsnap=debug
+          export RUST_LOG=coldsnap=debug,aws_smithy_client=debug,aws_sdk_ebs=debug
+
+          vmstat 5 > /tmp/vmstat-run2.log 2>&1 &
+          VMSTAT_PID=$!
+          bash -c 'while true; do echo "$(date -u) $(cat /proc/net/dev | grep eth0)"; sleep 5; done' > /tmp/netstat-run2.log 2>&1 &
+          NET_PID=$!
+
           start=$SECONDS
-          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run2.log &
+          coldsnap upload /tmp/nixos-test.raw 2>/tmp/coldsnap-stderr-run2.log | tee /tmp/coldsnap-run2.log &
           PID=$!
+
           while kill -0 $PID 2>/dev/null; do
-            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
-            sleep 30
+            elapsed=$(( SECONDS - start ))
+            conns=$(ss -tn state established 2>/dev/null | grep -c "amazonaws" || echo "?")
+            echo "[$(date -u)] ${elapsed}s elapsed | connections=$conns"
+            sleep 15
           done
+
           wait $PID
           STATUS=$?
           elapsed=$(( SECONDS - start ))
           snap_id=$(tail -1 /tmp/coldsnap-run2.log)
+
+          kill $VMSTAT_PID $NET_PID 2>/dev/null || true
+
           echo ""
           echo "=== Run 2 complete ==="
           echo "Exit code: $STATUS"
@@ -113,24 +282,49 @@ jobs:
             raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
             throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
             echo "Throughput: ~${throughput} MB/s"
+          fi
+          echo ""
+          echo "=== Coldsnap stderr (debug logs) ==="
+          head -100 /tmp/coldsnap-stderr-run2.log 2>/dev/null || echo "(empty)"
+          echo "..."
+          tail -50 /tmp/coldsnap-stderr-run2.log 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== Network activity during upload ==="
+          cat /tmp/netstat-run2.log 2>/dev/null | head -30 || echo "(empty)"
+
+          if [ $STATUS -eq 0 ]; then
             aws ec2 delete-snapshot --snapshot-id "$snap_id"
           fi
+
       - name: Coldsnap upload - run 3
         timeout-minutes: 15
         run: |
           echo "=== Starting coldsnap upload run 3 at $(date -u) ==="
-          export RUST_LOG=coldsnap=debug
+          export RUST_LOG=coldsnap=debug,aws_smithy_client=debug,aws_sdk_ebs=debug
+
+          vmstat 5 > /tmp/vmstat-run3.log 2>&1 &
+          VMSTAT_PID=$!
+          bash -c 'while true; do echo "$(date -u) $(cat /proc/net/dev | grep eth0)"; sleep 5; done' > /tmp/netstat-run3.log 2>&1 &
+          NET_PID=$!
+
           start=$SECONDS
-          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run3.log &
+          coldsnap upload /tmp/nixos-test.raw 2>/tmp/coldsnap-stderr-run3.log | tee /tmp/coldsnap-run3.log &
           PID=$!
+
           while kill -0 $PID 2>/dev/null; do
-            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
-            sleep 30
+            elapsed=$(( SECONDS - start ))
+            conns=$(ss -tn state established 2>/dev/null | grep -c "amazonaws" || echo "?")
+            echo "[$(date -u)] ${elapsed}s elapsed | connections=$conns"
+            sleep 15
           done
+
           wait $PID
           STATUS=$?
           elapsed=$(( SECONDS - start ))
           snap_id=$(tail -1 /tmp/coldsnap-run3.log)
+
+          kill $VMSTAT_PID $NET_PID 2>/dev/null || true
+
           echo ""
           echo "=== Run 3 complete ==="
           echo "Exit code: $STATUS"
@@ -140,5 +334,34 @@ jobs:
             raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
             throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
             echo "Throughput: ~${throughput} MB/s"
+          fi
+          echo ""
+          echo "=== Coldsnap stderr (debug logs) ==="
+          head -100 /tmp/coldsnap-stderr-run3.log 2>/dev/null || echo "(empty)"
+          echo "..."
+          tail -50 /tmp/coldsnap-stderr-run3.log 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== Network activity during upload ==="
+          cat /tmp/netstat-run3.log 2>/dev/null | head -30 || echo "(empty)"
+
+          if [ $STATUS -eq 0 ]; then
             aws ec2 delete-snapshot --snapshot-id "$snap_id"
           fi
+
+      # ========== CONTROL TEST: S3 UPLOAD ==========
+
+      - name: Control test - S3 upload same file
+        run: |
+          echo "=== Uploading same 4.1G raw file to S3 for comparison ==="
+          BUCKET="coldsnap-test-$(date +%s)"
+          aws s3 mb "s3://$BUCKET" --region us-east-1
+
+          start=$SECONDS
+          aws s3 cp /tmp/nixos-test.raw "s3://$BUCKET/nixos-test.raw" --region us-east-1 2>&1
+          elapsed=$(( SECONDS - start ))
+          raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+          throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+          echo "S3 upload: ${elapsed}s (~${throughput} MB/s)"
+
+          echo "Cleaning up..."
+          aws s3 rb "s3://$BUCKET" --force --region us-east-1
