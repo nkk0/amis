@@ -29,30 +29,116 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: us-east-1
+      - name: Install tools
+        run: |
+          echo "::group::Installing coldsnap and qemu"
+          nix profile install nixpkgs#coldsnap nixpkgs#qemu
+          echo "::endgroup::"
+          coldsnap --version
+          qemu-img --version | head -1
       - name: Convert VHD to raw
         run: |
           image_file=$(jq -r '.file' < '${{ steps.download_ami.outputs.image_info }}')
-          echo "Converting $image_file to raw"
-          nix shell nixpkgs#qemu -c qemu-img convert -O raw "$image_file" /tmp/nixos-test.raw
+          echo "Image file: $image_file"
+          ls -lh "$image_file"
+          echo "Converting to raw..."
+          qemu-img convert -O raw "$image_file" /tmp/nixos-test.raw
+          echo "Raw image:"
           ls -lh /tmp/nixos-test.raw
+      - name: Network diagnostics
+        run: |
+          echo "=== Runner info ==="
+          uname -a
+          nproc
+          free -h | head -2
+          echo ""
+          echo "=== Network to EBS endpoint ==="
+          curl -so /dev/null -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTLS: %{time_appconnect}s\nTotal: %{time_total}s\nHTTP code: %{http_code}\n" https://ebs.us-east-1.amazonaws.com/ || true
+          echo ""
+          echo "=== Network to S3 (for comparison) ==="
+          curl -so /dev/null -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTLS: %{time_appconnect}s\nTotal: %{time_total}s\nHTTP code: %{http_code}\n" https://s3.us-east-1.amazonaws.com/ || true
+          echo ""
+          echo "=== Bandwidth test (download 100MB from S3) ==="
+          time curl -so /dev/null https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz || true
       - name: Coldsnap upload - run 1
+        timeout-minutes: 15
         run: |
-          echo "Starting coldsnap upload run 1"
+          echo "=== Starting coldsnap upload run 1 at $(date -u) ==="
+          export RUST_LOG=coldsnap=debug
           start=$SECONDS
-          snap_id=$(nix shell nixpkgs#coldsnap -c coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /dev/stderr | tail -1)
-          echo "Run 1: $(( SECONDS - start ))s — snapshot: $snap_id"
-          aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run1.log &
+          PID=$!
+          # Print a heartbeat every 30s so we know it's alive
+          while kill -0 $PID 2>/dev/null; do
+            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
+            sleep 30
+          done
+          wait $PID
+          STATUS=$?
+          elapsed=$(( SECONDS - start ))
+          snap_id=$(tail -1 /tmp/coldsnap-run1.log)
+          echo ""
+          echo "=== Run 1 complete ==="
+          echo "Exit code: $STATUS"
+          echo "Wall time: ${elapsed}s"
+          echo "Snapshot: $snap_id"
+          if [ $STATUS -eq 0 ]; then
+            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+            echo "Throughput: ~${throughput} MB/s"
+            aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          fi
       - name: Coldsnap upload - run 2
+        timeout-minutes: 15
         run: |
-          echo "Starting coldsnap upload run 2"
+          echo "=== Starting coldsnap upload run 2 at $(date -u) ==="
+          export RUST_LOG=coldsnap=debug
           start=$SECONDS
-          snap_id=$(nix shell nixpkgs#coldsnap -c coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /dev/stderr | tail -1)
-          echo "Run 2: $(( SECONDS - start ))s — snapshot: $snap_id"
-          aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run2.log &
+          PID=$!
+          while kill -0 $PID 2>/dev/null; do
+            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
+            sleep 30
+          done
+          wait $PID
+          STATUS=$?
+          elapsed=$(( SECONDS - start ))
+          snap_id=$(tail -1 /tmp/coldsnap-run2.log)
+          echo ""
+          echo "=== Run 2 complete ==="
+          echo "Exit code: $STATUS"
+          echo "Wall time: ${elapsed}s"
+          echo "Snapshot: $snap_id"
+          if [ $STATUS -eq 0 ]; then
+            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+            echo "Throughput: ~${throughput} MB/s"
+            aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          fi
       - name: Coldsnap upload - run 3
+        timeout-minutes: 15
         run: |
-          echo "Starting coldsnap upload run 3"
+          echo "=== Starting coldsnap upload run 3 at $(date -u) ==="
+          export RUST_LOG=coldsnap=debug
           start=$SECONDS
-          snap_id=$(nix shell nixpkgs#coldsnap -c coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /dev/stderr | tail -1)
-          echo "Run 3: $(( SECONDS - start ))s — snapshot: $snap_id"
-          aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          coldsnap upload /tmp/nixos-test.raw 2>&1 | tee /tmp/coldsnap-run3.log &
+          PID=$!
+          while kill -0 $PID 2>/dev/null; do
+            echo "[$(date -u)] still uploading... ($(( SECONDS - start ))s elapsed)"
+            sleep 30
+          done
+          wait $PID
+          STATUS=$?
+          elapsed=$(( SECONDS - start ))
+          snap_id=$(tail -1 /tmp/coldsnap-run3.log)
+          echo ""
+          echo "=== Run 3 complete ==="
+          echo "Exit code: $STATUS"
+          echo "Wall time: ${elapsed}s"
+          echo "Snapshot: $snap_id"
+          if [ $STATUS -eq 0 ]; then
+            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+            echo "Throughput: ~${throughput} MB/s"
+            aws ec2 delete-snapshot --snapshot-id "$snap_id"
+          fi
