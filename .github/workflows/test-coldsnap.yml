@@ -11,12 +11,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: "patched, 32 workers"
-            workers: "32"
-          - label: "patched, 16 workers"
-            workers: "16"
-          - label: "patched, 64 workers (default)"
-            workers: ""
+          - label: "64w, 1 client"
+            workers: "64"
+            shards: ""
+            hedge: ""
+          - label: "128w, 1 client"
+            workers: "128"
+            shards: ""
+            hedge: ""
+          - label: "128w, 8 shards"
+            workers: "128"
+            shards: "8"
+            hedge: ""
+          - label: "128w, 8 shards, hedge@2s"
+            workers: "128"
+            shards: "8"
+            hedge: "2"
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - uses: DeterminateSystems/nix-installer-action@7993355175c2765e5733dae74f3e0786fe0e5c4f # v12
@@ -37,97 +47,12 @@ jobs:
       - name: Build patched coldsnap
         run: |
           echo "::group::Installing Rust toolchain and deps"
-          nix profile install nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl nixpkgs#qemu nixpkgs#strace
+          nix profile install nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl nixpkgs#qemu
           echo "::endgroup::"
           echo "::group::Cloning and patching coldsnap"
           git clone --depth 1 https://github.com/awslabs/coldsnap.git /tmp/coldsnap-patched
           cd /tmp/coldsnap-patched
-          git apply - <<'PATCH'
-          diff --git a/src/bin/coldsnap/main.rs b/src/bin/coldsnap/main.rs
-          index 708beeb..07517ac 100644
-          --- a/src/bin/coldsnap/main.rs
-          +++ b/src/bin/coldsnap/main.rs
-          @@ -12,6 +12,7 @@ use aws_config::default_provider::region::DefaultRegionChain;
-           use aws_sdk_ebs::types::Tag;
-           use aws_sdk_ebs::Client as EbsClient;
-           use aws_sdk_ec2::Client as Ec2Client;
-          +use aws_config::timeout::TimeoutConfig;
-           use aws_types::app_name::AppName;
-           use aws_types::region::Region;
-           use aws_types::SdkConfig;
-          @@ -115,6 +116,7 @@ async fn run() -> Result<()> {
-                               progress_bar?,
-                               zero_blocks,
-                               upload_args.kms_key_id,
-          +                    upload_args.workers,
-                           )
-                           .await
-                           .context(error::UploadSnapshotSnafu)?;
-          @@ -222,6 +224,15 @@ async fn build_client_config(
-                   config = config.endpoint_url(endpoint);
-               }
-
-          +    // Set per-attempt and overall operation timeouts so that hung requests
-          +    // fail fast instead of blocking the upload indefinitely.
-          +    config = config.timeout_config(
-          +        TimeoutConfig::builder()
-          +            .operation_attempt_timeout(Duration::from_secs(60))
-          +            .operation_timeout(Duration::from_secs(300))
-          +            .build(),
-          +    );
-          +
-               config.load().await
-           }
-
-          @@ -396,6 +407,10 @@ struct UploadArgs {
-               #[argh(switch)]
-               /// omit blocks of all zeros when uploading
-               omit_zero_blocks: bool,
-          +
-          +    #[argh(option)]
-          +    /// number of concurrent upload workers (default: 64)
-          +    workers: Option<usize>,
-           }
-
-           /// Turn a user-specified duration in seconds into a Duration object, for argh parsing.
-          diff --git a/src/lib.rs b/src/lib.rs
-          index a392637..cb8239b 100644
-          --- a/src/lib.rs
-          +++ b/src/lib.rs
-          @@ -34,7 +34,7 @@ let client = EbsClient::new(&aws_config::from_env().region("us-west-2").load().a
-           let uploader = SnapshotUploader::new(client);
-           let path = Path::new("./disk.img");
-
-          -let snapshot_id = uploader.upload_from_file(&path, None, None, None, None, None, None)
-          +let snapshot_id = uploader.upload_from_file(&path, None, None, None, None, None, None, None)
-                   .await
-                   .expect("failed to upload snapshot");
-           # }
-          diff --git a/src/upload.rs b/src/upload.rs
-          index 1d7d682..7bc6879 100644
-          --- a/src/upload.rs
-          +++ b/src/upload.rs
-          @@ -89,6 +89,7 @@ impl SnapshotUploader {
-                   progress_bar: Option<ProgressBar>,
-                   zero_blocks: Option<ZeroBlocks>,
-                   kms_key_id: Option<String>,
-          +        workers: Option<usize>,
-               ) -> Result<String> {
-                   let path = path.as_ref();
-                   let description = description.map(|s| s.to_string()).unwrap_or_else(|| {
-          @@ -197,8 +198,10 @@ impl SnapshotUploader {
-                   // Distribute the work across a fixed number of concurrent workers.
-                   // New threads will be created by the runtime as needed, but we'll
-                   // only process this many blocks at once to limit resource usage.
-          +        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
-          +        debug!("Using {} concurrent upload workers", worker_count);
-                   let upload = stream::iter(block_contexts).for_each_concurrent(
-          -            SNAPSHOT_BLOCK_WORKERS,
-          +            worker_count,
-                       |context| async move {
-                           for attempt in 0..SNAPSHOT_BLOCK_ATTEMPTS {
-                               // Increasing wait between attempts.  (No wait to start, on 0th attempt.)
-          PATCH
+          git apply "$GITHUB_WORKSPACE/coldsnap-v5.patch"
           echo "::endgroup::"
           echo "::group::Building coldsnap"
           cargo build --release 2>&1
@@ -164,25 +89,35 @@ jobs:
           echo "S3 upload: ${elapsed}s (~${throughput} MB/s)"
           aws s3 rb "s3://$BUCKET" --force --region us-east-1
 
-      - name: "Coldsnap upload run 1 — ${{ matrix.label }}"
+      - name: "Coldsnap upload — ${{ matrix.label }}"
         timeout-minutes: 10
         env:
           AWS_MAX_ATTEMPTS: "1"
           RUST_BACKTRACE: "full"
+          RUST_LOG: "coldsnap=info"
         run: |
           set +e
 
           COLDSNAP=/tmp/coldsnap-patched/target/release/coldsnap
           WORKERS="${{ matrix.workers }}"
-          WORKER_FLAG=""
-          if [ -n "$WORKERS" ]; then
-            WORKER_FLAG="--workers $WORKERS"
+          SHARDS="${{ matrix.shards }}"
+          HEDGE="${{ matrix.hedge }}"
+
+          FLAGS="--workers $WORKERS"
+          if [ -n "$SHARDS" ]; then
+            FLAGS="$FLAGS --client-shards $SHARDS"
+          fi
+          if [ -n "$HEDGE" ]; then
+            FLAGS="$FLAGS --hedge-timeout $HEDGE"
           fi
 
           echo "=== Config ==="
-          echo "AWS_MAX_ATTEMPTS: $AWS_MAX_ATTEMPTS"
-          echo "Workers: ${WORKERS:-64 (default)}"
-          echo "Timeouts: operation_attempt=60s, operation=300s (patched)"
+          echo "Workers: $WORKERS"
+          echo "Client shards: ${SHARDS:-1 (default)}"
+          echo "Hedge timeout: ${HEDGE:-none}"
+          echo "Timeouts: read=8s, attempt=15s, operation=90s"
+          echo "SDK retries: 1 (disabled), block retries: 4"
+          echo "Flags: $FLAGS"
           echo ""
 
           # Network monitor
@@ -195,39 +130,19 @@ jobs:
           NET_PID=$!
 
           echo "=== Starting upload at $(date -u) ==="
-          echo "Command: $COLDSNAP --verbose upload $WORKER_FLAG /tmp/nixos-test.raw"
+          echo "Command: $COLDSNAP --verbose upload $FLAGS /tmp/nixos-test.raw"
           start=$SECONDS
 
-          $COLDSNAP --verbose upload $WORKER_FLAG /tmp/nixos-test.raw > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
+          $COLDSNAP --verbose upload $FLAGS /tmp/nixos-test.raw > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
           CSPID=$!
 
-          # Monitor loop — also capture ss state when stalling
-          stall_captured=false
+          # Monitor loop
           while kill -0 $CSPID 2>/dev/null; do
             elapsed=$(( SECONDS - start ))
             conns=$(ss -tn state established 2>/dev/null | grep -c "443" || echo "0")
             net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
             stderr_lines=$(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo "0")
             echo "[$(date -u +%H:%M:%S)] ${elapsed}s | conns=$conns | stderr=$stderr_lines | $net_line"
-
-            # If past 45s and still running, capture detailed socket + strace info
-            if [ $elapsed -gt 45 ] && [ "$stall_captured" = "false" ]; then
-              stall_captured=true
-              echo ""
-              echo "=== STALL DETECTED at ${elapsed}s — capturing diagnostics ==="
-              echo ""
-              echo "--- ss -tinp (TCP socket details) ---"
-              ss -tinp state established 2>/dev/null | grep -A2 "443" || echo "(none)"
-              echo ""
-              echo "--- /proc/$CSPID/status ---"
-              cat /proc/$CSPID/status 2>/dev/null | grep -E "State|Threads|VmRSS" || echo "(not available)"
-              echo ""
-              echo "--- strace (5 seconds) ---"
-              timeout 5 strace -f -tt -e trace=network,read,write,epoll_wait -p $CSPID 2>/tmp/strace-output.log || true
-              head -100 /tmp/strace-output.log 2>/dev/null || echo "(empty)"
-              echo "... ($(wc -l < /tmp/strace-output.log 2>/dev/null || echo 0) total lines)"
-              echo ""
-            fi
             sleep 10
           done
 
@@ -252,152 +167,15 @@ jobs:
           echo "=== STDOUT ==="
           cat /tmp/coldsnap-stdout.log 2>/dev/null || echo "(empty)"
           echo ""
-          echo "=== STDERR (up to 300 lines) ==="
-          head -300 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR (full — includes histogram) ==="
+          cat /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
           echo "($(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo 0) total lines)"
           echo ""
           echo "=== Network throughput log ==="
           cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
-          echo ""
-          echo "=== Full strace output (if captured, up to 200 lines) ==="
-          head -200 /tmp/strace-output.log 2>/dev/null || echo "(not captured — upload finished in time)"
 
           if [ $STATUS -eq 0 ] && [ -n "$snap_id" ]; then
             aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
           fi
-
-          exit $STATUS
-
-      - name: "Coldsnap upload run 2 — ${{ matrix.label }}"
-        if: success()
-        timeout-minutes: 10
-        env:
-          AWS_MAX_ATTEMPTS: "1"
-          RUST_BACKTRACE: "full"
-        run: |
-          set +e
-
-          COLDSNAP=/tmp/coldsnap-patched/target/release/coldsnap
-          WORKERS="${{ matrix.workers }}"
-          WORKER_FLAG=""
-          if [ -n "$WORKERS" ]; then
-            WORKER_FLAG="--workers $WORKERS"
-          fi
-
-          bash -c 'prev_tx=0; while true; do
-            tx=$(awk "/eth0/ {print \$10}" /proc/net/dev)
-            dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
-            if [ $prev_tx -ne 0 ]; then echo "$(date -u +%H:%M:%S) tx=${dtx}MB/5s"; fi
-            prev_tx=$tx; sleep 5
-          done' > /tmp/net-monitor.log 2>&1 &
-          NET_PID=$!
-
-          echo "=== Starting upload at $(date -u) ==="
-          start=$SECONDS
-          $COLDSNAP --verbose upload $WORKER_FLAG /tmp/nixos-test.raw > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
-          CSPID=$!
-
-          stall_captured=false
-          while kill -0 $CSPID 2>/dev/null; do
-            elapsed=$(( SECONDS - start ))
-            conns=$(ss -tn state established 2>/dev/null | grep -c "443" || echo "0")
-            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
-            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | conns=$conns | $net_line"
-
-            if [ $elapsed -gt 45 ] && [ "$stall_captured" = "false" ]; then
-              stall_captured=true
-              echo "=== STALL at ${elapsed}s ==="
-              ss -tinp state established 2>/dev/null | grep -A2 "443" || true
-              timeout 5 strace -f -tt -e trace=network,read,write,epoll_wait -p $CSPID 2>/tmp/strace-output.log || true
-              head -100 /tmp/strace-output.log 2>/dev/null || true
-            fi
-            sleep 10
-          done
-
-          wait $CSPID
-          STATUS=$?
-          elapsed=$(( SECONDS - start ))
-          kill $NET_PID 2>/dev/null || true
-
-          echo ""
-          echo "EXIT CODE: $STATUS | WALL TIME: ${elapsed}s"
-          if [ $STATUS -eq 0 ]; then
-            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
-            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
-            echo "Throughput: ~$(( raw_bytes / elapsed / 1024 / 1024 )) MB/s | Snapshot: $snap_id"
-            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
-          fi
-          echo ""
-          echo "=== STDERR ==="
-          head -300 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
-          echo "=== Net ==="
-          cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
-
-          exit $STATUS
-
-      - name: "Coldsnap upload run 3 — ${{ matrix.label }}"
-        if: success()
-        timeout-minutes: 10
-        env:
-          AWS_MAX_ATTEMPTS: "1"
-          RUST_BACKTRACE: "full"
-        run: |
-          set +e
-
-          COLDSNAP=/tmp/coldsnap-patched/target/release/coldsnap
-          WORKERS="${{ matrix.workers }}"
-          WORKER_FLAG=""
-          if [ -n "$WORKERS" ]; then
-            WORKER_FLAG="--workers $WORKERS"
-          fi
-
-          bash -c 'prev_tx=0; while true; do
-            tx=$(awk "/eth0/ {print \$10}" /proc/net/dev)
-            dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
-            if [ $prev_tx -ne 0 ]; then echo "$(date -u +%H:%M:%S) tx=${dtx}MB/5s"; fi
-            prev_tx=$tx; sleep 5
-          done' > /tmp/net-monitor.log 2>&1 &
-          NET_PID=$!
-
-          echo "=== Starting upload at $(date -u) ==="
-          start=$SECONDS
-          $COLDSNAP --verbose upload $WORKER_FLAG /tmp/nixos-test.raw > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
-          CSPID=$!
-
-          stall_captured=false
-          while kill -0 $CSPID 2>/dev/null; do
-            elapsed=$(( SECONDS - start ))
-            conns=$(ss -tn state established 2>/dev/null | grep -c "443" || echo "0")
-            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
-            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | conns=$conns | $net_line"
-
-            if [ $elapsed -gt 45 ] && [ "$stall_captured" = "false" ]; then
-              stall_captured=true
-              echo "=== STALL at ${elapsed}s ==="
-              ss -tinp state established 2>/dev/null | grep -A2 "443" || true
-              timeout 5 strace -f -tt -e trace=network,read,write,epoll_wait -p $CSPID 2>/tmp/strace-output.log || true
-              head -100 /tmp/strace-output.log 2>/dev/null || true
-            fi
-            sleep 10
-          done
-
-          wait $CSPID
-          STATUS=$?
-          elapsed=$(( SECONDS - start ))
-          kill $NET_PID 2>/dev/null || true
-
-          echo ""
-          echo "EXIT CODE: $STATUS | WALL TIME: ${elapsed}s"
-          if [ $STATUS -eq 0 ]; then
-            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
-            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
-            echo "Throughput: ~$(( raw_bytes / elapsed / 1024 / 1024 )) MB/s | Snapshot: $snap_id"
-            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
-          fi
-          echo ""
-          echo "=== STDERR ==="
-          head -300 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
-          echo "=== Net ==="
-          cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
 
           exit $STATUS

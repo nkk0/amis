@@ -1,0 +1,445 @@
+diff --git a/src/bin/coldsnap/main.rs b/src/bin/coldsnap/main.rs
+index 708beeb..8bbb1b5 100644
+--- a/src/bin/coldsnap/main.rs
++++ b/src/bin/coldsnap/main.rs
+@@ -12,6 +12,8 @@ use aws_config::default_provider::region::DefaultRegionChain;
+ use aws_sdk_ebs::types::Tag;
+ use aws_sdk_ebs::Client as EbsClient;
+ use aws_sdk_ec2::Client as Ec2Client;
++use aws_config::retry::RetryConfig;
++use aws_config::timeout::TimeoutConfig;
+ use aws_types::app_name::AppName;
+ use aws_types::region::Region;
+ use aws_types::SdkConfig;
+@@ -85,8 +87,17 @@ async fn run() -> Result<()> {
+         }
+ 
+         SubCommand::Upload(upload_args) => {
+-            let client = EbsClient::new(&client_config);
+-            let uploader = SnapshotUploader::new(client);
++            let num_shards = upload_args.client_shards.unwrap_or(1);
++            let uploader = if num_shards <= 1 {
++                let client = EbsClient::new(&client_config);
++                SnapshotUploader::new(client)
++            } else {
++                debug!("Creating {} EBS client shards", num_shards);
++                let clients: Vec<_> = (0..num_shards)
++                    .map(|_| EbsClient::new(&client_config))
++                    .collect();
++                SnapshotUploader::with_client_shards(clients)
++            };
+             ensure!(
+                 upload_args.file.file_name().is_some(),
+                 error::ValidateFilenameSnafu {
+@@ -115,6 +126,8 @@ async fn run() -> Result<()> {
+                     progress_bar?,
+                     zero_blocks,
+                     upload_args.kms_key_id,
++                    upload_args.workers,
++                    upload_args.hedge_timeout,
+                 )
+                 .await
+                 .context(error::UploadSnapshotSnafu)?;
+@@ -222,6 +235,19 @@ async fn build_client_config(
+         config = config.endpoint_url(endpoint);
+     }
+ 
++    // Fail fast on hung requests: read_timeout catches the common case where
++    // the request body is sent but the response never arrives. Disable SDK
++    // retries since coldsnap has its own retry loop.
++    config = config
++        .timeout_config(
++            TimeoutConfig::builder()
++                .read_timeout(Duration::from_secs(8))
++                .operation_attempt_timeout(Duration::from_secs(15))
++                .operation_timeout(Duration::from_secs(90))
++                .build(),
++        )
++        .retry_config(RetryConfig::standard().with_max_attempts(1));
++
+     config.load().await
+ }
+ 
+@@ -396,6 +422,18 @@ struct UploadArgs {
+     #[argh(switch)]
+     /// omit blocks of all zeros when uploading
+     omit_zero_blocks: bool,
++
++    #[argh(option)]
++    /// number of concurrent upload workers (default: 64)
++    workers: Option<usize>,
++
++    #[argh(option)]
++    /// number of EBS client shards for connection pool isolation (default: 1)
++    client_shards: Option<usize>,
++
++    #[argh(option, from_str_fn(seconds_from_str))]
++    /// fire a hedged duplicate request after this many seconds (requires --client-shards > 1)
++    hedge_timeout: Option<Duration>,
+ }
+ 
+ /// Turn a user-specified duration in seconds into a Duration object, for argh parsing.
+diff --git a/src/lib.rs b/src/lib.rs
+index a392637..787bdfe 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -34,7 +34,7 @@ let client = EbsClient::new(&aws_config::from_env().region("us-west-2").load().a
+ let uploader = SnapshotUploader::new(client);
+ let path = Path::new("./disk.img");
+ 
+-let snapshot_id = uploader.upload_from_file(&path, None, None, None, None, None, None)
++let snapshot_id = uploader.upload_from_file(&path, None, None, None, None, None, None, None, None)
+         .await
+         .expect("failed to upload snapshot");
+ # }
+diff --git a/src/upload.rs b/src/upload.rs
+index 1d7d682..6805fd2 100644
+--- a/src/upload.rs
++++ b/src/upload.rs
+@@ -14,7 +14,7 @@ use base64::Engine as _;
+ use bytes::BytesMut;
+ use futures::stream::{self, StreamExt};
+ use indicatif::ProgressBar;
+-use log::debug;
++use log::{debug, warn};
+ use sha2::{Digest, Sha256};
+ use snafu::{ensure, OptionExt, ResultExt, Snafu};
+ use std::cmp;
+@@ -24,7 +24,7 @@ use std::ffi::OsStr;
+ use std::io::SeekFrom;
+ use std::os::unix::fs::FileTypeExt;
+ use std::path::{Path, PathBuf};
+-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
++use std::sync::atomic::{AtomicI32, AtomicU64, Ordering as AtomicOrdering};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ use tokio::fs::{self, File};
+@@ -36,12 +36,70 @@ pub struct Error(error::Error);
+ type Result<T> = std::result::Result<T, Error>;
+ 
+ const GIBIBYTE: i64 = 1024 * 1024 * 1024;
++
++/// Simple latency histogram for upload diagnostics.
++struct LatencyHistogram {
++    under_250ms: AtomicU64,
++    ms_250_500: AtomicU64,
++    ms_500_1s: AtomicU64,
++    s_1_2: AtomicU64,
++    s_2_5: AtomicU64,
++    over_5s: AtomicU64,
++    timeouts: AtomicU64,
++}
++
++impl LatencyHistogram {
++    fn new() -> Self {
++        Self {
++            under_250ms: AtomicU64::new(0),
++            ms_250_500: AtomicU64::new(0),
++            ms_500_1s: AtomicU64::new(0),
++            s_1_2: AtomicU64::new(0),
++            s_2_5: AtomicU64::new(0),
++            over_5s: AtomicU64::new(0),
++            timeouts: AtomicU64::new(0),
++        }
++    }
++
++    fn record_success(&self, elapsed: Duration) {
++        let ms = elapsed.as_millis();
++        if ms < 250 {
++            self.under_250ms.fetch_add(1, AtomicOrdering::Relaxed);
++        } else if ms < 500 {
++            self.ms_250_500.fetch_add(1, AtomicOrdering::Relaxed);
++        } else if ms < 1000 {
++            self.ms_500_1s.fetch_add(1, AtomicOrdering::Relaxed);
++        } else if ms < 2000 {
++            self.s_1_2.fetch_add(1, AtomicOrdering::Relaxed);
++        } else if ms < 5000 {
++            self.s_2_5.fetch_add(1, AtomicOrdering::Relaxed);
++        } else {
++            self.over_5s.fetch_add(1, AtomicOrdering::Relaxed);
++        }
++    }
++
++    fn record_timeout(&self) {
++        self.timeouts.fetch_add(1, AtomicOrdering::Relaxed);
++    }
++
++    fn report(&self) {
++        log::info!(
++            "Latency histogram: <250ms={} 250-500ms={} 500ms-1s={} 1-2s={} 2-5s={} >5s={} timeouts={}",
++            self.under_250ms.load(AtomicOrdering::Relaxed),
++            self.ms_250_500.load(AtomicOrdering::Relaxed),
++            self.ms_500_1s.load(AtomicOrdering::Relaxed),
++            self.s_1_2.load(AtomicOrdering::Relaxed),
++            self.s_2_5.load(AtomicOrdering::Relaxed),
++            self.over_5s.load(AtomicOrdering::Relaxed),
++            self.timeouts.load(AtomicOrdering::Relaxed),
++        );
++    }
++}
+ const SNAPSHOT_BLOCK_WORKERS: usize = 64;
+ // How long to wait between attempts; this number * attempt number, in seconds.
+ const SNAPSHOT_BLOCK_RETRY_SCALE: u64 = 2;
+-// 12 retries with scale 2 gives us 132 seconds, chosen because it got past "snapshot does not
+-// exist" errors in testing.
+-const SNAPSHOT_BLOCK_ATTEMPTS: u64 = 12;
++// 4 retries with scale 2 gives us 12 seconds of backoff, plus per-attempt timeouts.
++const SNAPSHOT_BLOCK_ATTEMPTS: u64 = 4;
+ const SNAPSHOT_TIMEOUT_MINUTES: i32 = 10;
+ const SHA256_ALGORITHM: ChecksumAlgorithm = ChecksumAlgorithm::ChecksumAlgorithmSha256;
+ const LINEAR_METHOD: ChecksumAggregationMethod =
+@@ -59,12 +117,23 @@ pub enum ZeroBlocks {
+ }
+ 
+ pub struct SnapshotUploader {
+-    ebs_client: EbsClient,
++    ebs_clients: Vec<EbsClient>,
+ }
+ 
+ impl SnapshotUploader {
+     pub fn new(ebs_client: EbsClient) -> Self {
+-        SnapshotUploader { ebs_client }
++        SnapshotUploader {
++            ebs_clients: vec![ebs_client],
++        }
++    }
++
++    pub fn with_client_shards(ebs_clients: Vec<EbsClient>) -> Self {
++        assert!(!ebs_clients.is_empty());
++        SnapshotUploader { ebs_clients }
++    }
++
++    fn client_for_block(&self, block_index: i32) -> &EbsClient {
++        &self.ebs_clients[block_index as usize % self.ebs_clients.len()]
+     }
+ 
+     /// Upload a snapshot from the file at the specified path.
+@@ -89,6 +158,8 @@ impl SnapshotUploader {
+         progress_bar: Option<ProgressBar>,
+         zero_blocks: Option<ZeroBlocks>,
+         kms_key_id: Option<String>,
++        workers: Option<usize>,
++        hedge_timeout: Option<Duration>,
+     ) -> Result<String> {
+         let path = path.as_ref();
+         let description = description.map(|s| s.to_string()).unwrap_or_else(|| {
+@@ -187,7 +258,7 @@ impl SnapshotUploader {
+                 block_digests: Arc::clone(&block_digests),
+                 block_errors: Arc::clone(&block_errors),
+                 progress_bar: Arc::clone(&progress_bar),
+-                ebs_client: self.ebs_client.clone(),
++                ebs_client: self.client_for_block(i).clone(),
+                 zero_blocks,
+             });
+ 
+@@ -197,30 +268,82 @@ impl SnapshotUploader {
+         // Distribute the work across a fixed number of concurrent workers.
+         // New threads will be created by the runtime as needed, but we'll
+         // only process this many blocks at once to limit resource usage.
++        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
++        debug!(
++            "Using {} concurrent upload workers, {} client shards",
++            worker_count,
++            self.ebs_clients.len()
++        );
++        let histogram = Arc::new(LatencyHistogram::new());
++        let hedge_timeout = hedge_timeout;
+         let upload = stream::iter(block_contexts).for_each_concurrent(
+-            SNAPSHOT_BLOCK_WORKERS,
+-            |context| async move {
+-                for attempt in 0..SNAPSHOT_BLOCK_ATTEMPTS {
+-                    // Increasing wait between attempts.  (No wait to start, on 0th attempt.)
+-                    time::sleep(Duration::from_secs(attempt * SNAPSHOT_BLOCK_RETRY_SCALE)).await;
+-
+-                    let block_result = self.upload_block(&context).await;
+-                    let mut block_errors = context.block_errors.lock().expect("poisoned");
+-                    if let Err(e) = block_result {
+-                        debug!(
+-                            "Error uploading block, attempt {} of {}",
+-                            attempt + 1,
+-                            SNAPSHOT_BLOCK_ATTEMPTS
+-                        );
+-                        block_errors.insert(context.block_index, e);
+-                        continue;
++            worker_count,
++            |context| {
++                let histogram = Arc::clone(&histogram);
++                async move {
++                    for attempt in 0..SNAPSHOT_BLOCK_ATTEMPTS {
++                        // Increasing wait between attempts.
++                        let backoff = Duration::from_secs(attempt * SNAPSHOT_BLOCK_RETRY_SCALE);
++                        if attempt > 0 {
++                            debug!(
++                                "block {}: retry {}/{}, backoff {}s",
++                                context.block_index, attempt, SNAPSHOT_BLOCK_ATTEMPTS, backoff.as_secs()
++                            );
++                        }
++                        time::sleep(backoff).await;
++
++                        let start = std::time::Instant::now();
++                        let block_result = if let Some(ht) = hedge_timeout {
++                            // Hedged request: race the primary against a delayed
++                            // duplicate on a different client shard.
++                            self.upload_block_hedged(&context, ht).await
++                        } else {
++                            self.upload_block(&context).await
++                        };
++                        let elapsed = start.elapsed();
++                        match block_result {
++                            Err(e) => {
++                                histogram.record_timeout();
++                                warn!(
++                                    "block {}: attempt {}/{} failed after {:.1}s: {}",
++                                    context.block_index,
++                                    attempt + 1,
++                                    SNAPSHOT_BLOCK_ATTEMPTS,
++                                    elapsed.as_secs_f64(),
++                                    e
++                                );
++                                let mut block_errors = context.block_errors.lock().expect("poisoned");
++                                block_errors.insert(context.block_index, e);
++                                continue;
++                            }
++                            Ok(maybe_hash) => {
++                                histogram.record_success(elapsed);
++                                if elapsed.as_secs() > 2 {
++                                    debug!(
++                                        "block {}: slow success in {:.1}s (attempt {})",
++                                        context.block_index, elapsed.as_secs_f64(), attempt + 1
++                                    );
++                                }
++                                // Bookkeeping: insert digest and count (idempotent per block).
++                                if let Some(hash_bytes) = maybe_hash {
++                                    let mut block_digests = context.block_digests.lock().expect("poisoned");
++                                    block_digests.insert(context.block_index, hash_bytes);
++                                    context.changed_blocks_count.fetch_add(1, AtomicOrdering::Relaxed);
++                                }
++                                if let Some(ref progress_bar) = *context.progress_bar {
++                                    progress_bar.inc(1);
++                                }
++                                let mut block_errors = context.block_errors.lock().expect("poisoned");
++                                block_errors.remove(&context.block_index);
++                                break;
++                            }
++                        }
+                     }
+-                    block_errors.remove(&context.block_index);
+-                    break;
+                 }
+             },
+         );
+         upload.await;
++        histogram.report();
+ 
+         // At this point, all the concurrent jobs have finished, so all of the Arcs we copied have
+         // been dropped. Hence there's exactly one strong reference and it's safe to `try_unwrap`
+@@ -284,7 +407,7 @@ impl SnapshotUploader {
+         kms_key_id: Option<String>,
+     ) -> Result<(String, i32)> {
+         let mut request = self
+-            .ebs_client
++            .ebs_clients[0]
+             .start_snapshot()
+             .volume_size(volume_size)
+             .set_description(Some(description))
+@@ -316,7 +439,7 @@ impl SnapshotUploader {
+         changed_blocks_count: i32,
+         checksum: &str,
+     ) -> Result<()> {
+-        self.ebs_client
++        self.ebs_clients[0]
+             .complete_snapshot()
+             .snapshot_id(snapshot_id)
+             .changed_blocks_count(changed_blocks_count)
+@@ -330,8 +453,59 @@ impl SnapshotUploader {
+         Ok(())
+     }
+ 
++    /// Race a primary upload against a delayed hedge on a different client shard.
++    /// The hedge fires after `hedge_timeout`; whichever finishes first wins.
++    /// PutSnapshotBlock is idempotent for the same block index, so the duplicate
++    /// is safe.  If both the primary and hedge fail, the primary error is returned.
++    async fn upload_block_hedged(
++        &self,
++        context: &BlockContext,
++        hedge_timeout: Duration,
++    ) -> Result<Option<Vec<u8>>> {
++        // Only hedge when we have multiple client shards to use.
++        if self.ebs_clients.len() <= 1 {
++            return self.upload_block(context).await;
++        }
++
++        // Build a hedge context that uses a different client shard.
++        let hedge_shard_idx =
++            (context.block_index as usize + 1) % self.ebs_clients.len();
++        let hedge_context = BlockContext {
++            path: context.path.clone(),
++            data_length: context.data_length,
++            block_index: context.block_index,
++            block_size: context.block_size,
++            snapshot_id: context.snapshot_id.clone(),
++            changed_blocks_count: Arc::clone(&context.changed_blocks_count),
++            block_digests: Arc::clone(&context.block_digests),
++            block_errors: Arc::clone(&context.block_errors),
++            progress_bar: Arc::clone(&context.progress_bar),
++            ebs_client: self.ebs_clients[hedge_shard_idx].clone(),
++            zero_blocks: context.zero_blocks,
++        };
++
++        // Race: primary starts immediately, hedge fires after delay.
++        tokio::select! {
++            result = self.upload_block(context) => {
++                result
++            }
++            result = async {
++                time::sleep(hedge_timeout).await;
++                debug!("block {}: hedge fired after {}ms",
++                    context.block_index, hedge_timeout.as_millis());
++                self.upload_block(&hedge_context).await
++            } => {
++                result
++            }
++        }
++    }
++
+     /// Read from the file in context and upload a single block to the snapshot.
+-    async fn upload_block(&self, context: &BlockContext) -> Result<()> {
++    /// Returns `Ok(Some(hash_bytes))` when a block was uploaded, `Ok(None)` when
++    /// a zero block was skipped.  Callers are responsible for bookkeeping
++    /// (block_digests, changed_blocks_count, progress_bar) so that hedged
++    /// requests can safely deduplicate.
++    async fn upload_block(&self, context: &BlockContext) -> Result<Option<Vec<u8>>> {
+         let path: &Path = context.path.as_ref();
+         let mut f = File::open(path)
+             .await
+@@ -388,10 +562,7 @@ impl SnapshotUploader {
+             let sparse = block.iter().all(|&byte| byte == 0u8);
+             // Found a block of all zeroes, and told to omit those from the snapshot.
+             if sparse {
+-                if let Some(ref progress_bar) = *context.progress_bar {
+-                    progress_bar.inc(1);
+-                }
+-                return Ok(());
++                return Ok(None);
+             }
+         }
+ 
+@@ -432,17 +603,7 @@ impl SnapshotUploader {
+                 block_index,
+             })?;
+ 
+-        let mut block_digests = context.block_digests.lock().expect("poisoned");
+-        block_digests.insert(block_index, hash_bytes.to_vec());
+-
+-        let changed_blocks_count = &context.changed_blocks_count;
+-        changed_blocks_count.fetch_add(1, AtomicOrdering::Relaxed);
+-
+-        if let Some(ref progress_bar) = *context.progress_bar {
+-            progress_bar.inc(1);
+-        }
+-
+-        Ok(())
++        Ok(Some(hash_bytes.to_vec()))
+     }
+ }
+ 
