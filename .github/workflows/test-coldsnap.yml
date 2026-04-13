@@ -34,7 +34,7 @@ jobs:
           echo "::group::Installing coldsnap and qemu"
           nix profile install nixpkgs#coldsnap nixpkgs#qemu
           echo "::endgroup::"
-          coldsnap --version
+          coldsnap --help | head -1
           qemu-img --version | head -1
       - name: Convert VHD to raw
         run: |
