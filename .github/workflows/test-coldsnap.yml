@@ -52,7 +52,7 @@ jobs:
           ls -lh /tmp/nixos-test.raw
           stat -c "Exact bytes: %s" /tmp/nixos-test.raw
 
-      # ========== DIAGNOSTICS (condensed) ==========
+      # ========== DIAGNOSTICS ==========
 
       - name: Runner and network info
         run: |
@@ -81,13 +81,21 @@ jobs:
           echo ""
           echo "=== Download bandwidth (kernel.org, ~130MB) ==="
           curl -so /dev/null -w "Speed: %{speed_download} bytes/sec, Time: %{time_total}s\n" https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz || true
-          echo ""
-          echo "=== DNS: default endpoint ==="
-          dig +short ebs.us-east-1.amazonaws.com
-          echo "=== DNS: api.aws endpoint ==="
-          dig +short ebs.us-east-1.api.aws
 
-      # ========== S3 CONTROL (run first so we always get this data) ==========
+      # ========== VERIFY COLDSNAP FLAGS ==========
+
+      - name: Verify coldsnap command
+        run: |
+          echo "=== coldsnap help ==="
+          coldsnap --help
+          echo ""
+          echo "=== coldsnap upload help ==="
+          coldsnap upload --help
+          echo ""
+          echo "=== Exact command that will run ==="
+          echo "coldsnap --verbose ${{ matrix.endpoint_flag }} upload /tmp/nixos-test.raw"
+
+      # ========== S3 CONTROL ==========
 
       - name: "Control: S3 upload same 4.1G file"
         run: |
@@ -102,19 +110,32 @@ jobs:
           echo "S3 upload: ${elapsed}s (~${throughput} MB/s)"
           aws s3 rb "s3://$BUCKET" --force --region us-east-1
 
-      # ========== COLDSNAP UPLOAD ==========
+      # ========== COLDSNAP UPLOADS (3 runs) ==========
 
-      - name: "Coldsnap upload — ${{ matrix.label }}"
-        timeout-minutes: 15
+      - name: "Coldsnap upload run 1 — ${{ matrix.label }}"
+        timeout-minutes: 10
         env:
           AWS_MAX_ATTEMPTS: ${{ matrix.max_attempts }}
+          RUST_BACKTRACE: "full"
+          RUST_LOG: "coldsnap=trace,aws_smithy_runtime=debug,aws_sdk_ebs=debug"
         run: |
+          set +e  # Don't exit on error — we need to dump logs
+
           echo "=== Config ==="
-          echo "Endpoint flag: ${{ matrix.endpoint_flag }}"
           echo "AWS_MAX_ATTEMPTS: ${AWS_MAX_ATTEMPTS:-default}"
+          echo "Endpoint flag: '${{ matrix.endpoint_flag }}'"
+          echo "RUST_BACKTRACE: $RUST_BACKTRACE"
+          echo "RUST_LOG: $RUST_LOG"
           echo ""
 
-          # Monitor network bytes during upload
+          # NOTE: --endpoint is a TOP-LEVEL flag, not a subcommand flag
+          # Correct: coldsnap --verbose --endpoint <url> upload <file>
+          # Wrong:   coldsnap --verbose upload --endpoint <url> <file>
+          CMD="coldsnap --verbose ${{ matrix.endpoint_flag }} upload /tmp/nixos-test.raw"
+          echo "Command: $CMD"
+          echo ""
+
+          # Network monitor
           bash -c 'prev_rx=0; prev_tx=0; while true; do
             line=$(cat /proc/net/dev | grep eth0)
             rx=$(echo "$line" | awk "{print \$2}")
@@ -131,16 +152,18 @@ jobs:
 
           echo "=== Starting upload at $(date -u) ==="
           start=$SECONDS
-          coldsnap --verbose upload ${{ matrix.endpoint_flag }} /tmp/nixos-test.raw 2>/tmp/coldsnap-stderr.log &
+
+          # Run coldsnap, capture stdout and stderr separately
+          $CMD > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
           PID=$!
 
+          # Monitor loop
           while kill -0 $PID 2>/dev/null; do
             elapsed=$(( SECONDS - start ))
-            # Count established connections to any amazonaws/aws endpoint
-            conns=$(ss -tn state established 2>/dev/null | grep -cE "amazonaws|\.aws" || echo "0")
-            # Get latest network throughput
-            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "")
-            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | conns=$conns | $net_line"
+            conns=$(ss -tn state established 2>/dev/null | grep -cE "443" || echo "0")
+            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
+            stderr_lines=$(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo "0")
+            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | port-443-conns=$conns | stderr_lines=$stderr_lines | $net_line"
             sleep 10
           done
 
@@ -150,40 +173,179 @@ jobs:
           kill $NET_PID 2>/dev/null || true
 
           echo ""
-          echo "==============================="
-          echo "Exit code: $STATUS"
-          echo "Wall time: ${elapsed}s"
+          echo "============================================"
+          echo "EXIT CODE: $STATUS"
+          echo "WALL TIME: ${elapsed}s"
+          echo "============================================"
+
           if [ $STATUS -eq 0 ]; then
-            snap_id=$(cat /tmp/coldsnap-stderr.log | grep -oP 'snap-[a-f0-9]+' | tail -1)
-            if [ -z "$snap_id" ]; then
-              # coldsnap prints snapshot id to stdout
-              snap_id=$(cat /proc/$PID/fd/1 2>/dev/null || echo "unknown")
-            fi
+            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
             raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
             throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
             echo "Throughput: ~${throughput} MB/s"
             echo "Snapshot: $snap_id"
+            echo ""
+            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
           fi
-          echo "==============================="
+
           echo ""
-          echo "=== Coldsnap verbose output (first 200 lines) ==="
-          head -200 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
+          echo "=== STDOUT ==="
+          cat /tmp/coldsnap-stdout.log 2>/dev/null || echo "(empty)"
           echo ""
-          echo "=== Coldsnap verbose output (last 100 lines) ==="
-          tail -100 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR (all, up to 500 lines) ==="
+          head -500 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
           echo ""
-          echo "=== Stderr line count ==="
+          echo "=== STDERR line count ==="
           wc -l /tmp/coldsnap-stderr.log 2>/dev/null || echo "0"
           echo ""
           echo "=== Network throughput log ==="
           cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
 
-          # Clean up snapshot
+          # Exit with original status AFTER dumping all logs
+          exit $STATUS
+
+      - name: "Coldsnap upload run 2 — ${{ matrix.label }}"
+        if: success()
+        timeout-minutes: 10
+        env:
+          AWS_MAX_ATTEMPTS: ${{ matrix.max_attempts }}
+          RUST_BACKTRACE: "full"
+          RUST_LOG: "coldsnap=trace,aws_smithy_runtime=debug,aws_sdk_ebs=debug"
+        run: |
+          set +e
+
+          CMD="coldsnap --verbose ${{ matrix.endpoint_flag }} upload /tmp/nixos-test.raw"
+          echo "Command: $CMD"
+
+          bash -c 'prev_rx=0; prev_tx=0; while true; do
+            line=$(cat /proc/net/dev | grep eth0)
+            rx=$(echo "$line" | awk "{print \$2}")
+            tx=$(echo "$line" | awk "{print \$10}")
+            drx=$(( (rx - prev_rx) / 1024 / 1024 ))
+            dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
+            if [ $prev_rx -ne 0 ]; then
+              echo "$(date -u +%H:%M:%S) rx=${drx}MB/5s tx=${dtx}MB/5s"
+            fi
+            prev_rx=$rx; prev_tx=$tx
+            sleep 5
+          done' > /tmp/net-monitor.log 2>&1 &
+          NET_PID=$!
+
+          echo "=== Starting upload at $(date -u) ==="
+          start=$SECONDS
+          $CMD > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
+          PID=$!
+
+          while kill -0 $PID 2>/dev/null; do
+            elapsed=$(( SECONDS - start ))
+            conns=$(ss -tn state established 2>/dev/null | grep -cE "443" || echo "0")
+            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
+            stderr_lines=$(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo "0")
+            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | port-443-conns=$conns | stderr_lines=$stderr_lines | $net_line"
+            sleep 10
+          done
+
+          wait $PID
+          STATUS=$?
+          elapsed=$(( SECONDS - start ))
+          kill $NET_PID 2>/dev/null || true
+
+          echo ""
+          echo "============================================"
+          echo "EXIT CODE: $STATUS"
+          echo "WALL TIME: ${elapsed}s"
+          echo "============================================"
+
           if [ $STATUS -eq 0 ]; then
-            # Re-extract snapshot id from verbose logs or stdout
-            for sid in $(grep -oP 'snap-[a-f0-9]+' /tmp/coldsnap-stderr.log 2>/dev/null); do
-              aws ec2 delete-snapshot --snapshot-id "$sid" 2>/dev/null || true
-            done
+            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
+            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+            echo "Throughput: ~${throughput} MB/s"
+            echo "Snapshot: $snap_id"
+            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
           fi
+
+          echo ""
+          echo "=== STDOUT ==="
+          cat /tmp/coldsnap-stdout.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR (all, up to 500 lines) ==="
+          head -500 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR line count ==="
+          wc -l /tmp/coldsnap-stderr.log 2>/dev/null || echo "0"
+          echo "=== Network throughput log ==="
+          cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
+
+          exit $STATUS
+
+      - name: "Coldsnap upload run 3 — ${{ matrix.label }}"
+        if: success()
+        timeout-minutes: 10
+        env:
+          AWS_MAX_ATTEMPTS: ${{ matrix.max_attempts }}
+          RUST_BACKTRACE: "full"
+          RUST_LOG: "coldsnap=trace,aws_smithy_runtime=debug,aws_sdk_ebs=debug"
+        run: |
+          set +e
+
+          CMD="coldsnap --verbose ${{ matrix.endpoint_flag }} upload /tmp/nixos-test.raw"
+          echo "Command: $CMD"
+
+          bash -c 'prev_rx=0; prev_tx=0; while true; do
+            line=$(cat /proc/net/dev | grep eth0)
+            rx=$(echo "$line" | awk "{print \$2}")
+            tx=$(echo "$line" | awk "{print \$10}")
+            drx=$(( (rx - prev_rx) / 1024 / 1024 ))
+            dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
+            if [ $prev_rx -ne 0 ]; then
+              echo "$(date -u +%H:%M:%S) rx=${drx}MB/5s tx=${dtx}MB/5s"
+            fi
+            prev_rx=$rx; prev_tx=$tx
+            sleep 5
+          done' > /tmp/net-monitor.log 2>&1 &
+          NET_PID=$!
+
+          echo "=== Starting upload at $(date -u) ==="
+          start=$SECONDS
+          $CMD > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
+          PID=$!
+
+          while kill -0 $PID 2>/dev/null; do
+            elapsed=$(( SECONDS - start ))
+            conns=$(ss -tn state established 2>/dev/null | grep -cE "443" || echo "0")
+            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
+            stderr_lines=$(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo "0")
+            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | port-443-conns=$conns | stderr_lines=$stderr_lines | $net_line"
+            sleep 10
+          done
+
+          wait $PID
+          STATUS=$?
+          elapsed=$(( SECONDS - start ))
+          kill $NET_PID 2>/dev/null || true
+
+          echo ""
+          echo "============================================"
+          echo "EXIT CODE: $STATUS"
+          echo "WALL TIME: ${elapsed}s"
+          echo "============================================"
+
+          if [ $STATUS -eq 0 ]; then
+            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
+            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+            echo "Throughput: ~${throughput} MB/s"
+            echo "Snapshot: $snap_id"
+            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "=== STDOUT ==="
+          cat /tmp/coldsnap-stdout.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR (all, up to 500 lines) ==="
+          head -500 /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
+          echo "=== STDERR line count ==="
+          wc -l /tmp/coldsnap-stderr.log 2>/dev/null || echo "0"
+          echo "=== Network throughput log ==="
+          cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
 
           exit $STATUS
