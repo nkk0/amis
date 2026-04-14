@@ -11,20 +11,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - label: "32w, 1 client (control)"
+            workers: "32"
+            shards: ""
+            hedge: ""
           - label: "64w, 1 client"
             workers: "64"
             shards: ""
             hedge: ""
-          - label: "128w, 1 client"
-            workers: "128"
-            shards: ""
-            hedge: ""
-          - label: "128w, 8 shards"
-            workers: "128"
+          - label: "64w, 8 shards"
+            workers: "64"
             shards: "8"
             hedge: ""
-          - label: "128w, 8 shards, hedge@2s"
-            workers: "128"
+          - label: "64w, 8 shards, hedge@2s"
+            workers: "64"
             shards: "8"
             hedge: "2"
     steps:
