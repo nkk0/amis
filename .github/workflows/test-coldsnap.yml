@@ -90,7 +90,7 @@ jobs:
           aws s3 rb "s3://$BUCKET" --force --region us-east-1
 
       - name: "Coldsnap uploads (3 runs) — ${{ matrix.label }}"
-        timeout-minutes: 15
+        timeout-minutes: 25
         env:
           AWS_MAX_ATTEMPTS: "1"
           RUST_BACKTRACE: "full"
@@ -117,10 +117,10 @@ jobs:
           echo ""
 
           FAILS=0
-          for RUN in 1 2 3; do
+          for RUN in 1 2 3 4 5 6; do
             echo ""
             echo "========================================"
-            echo "=== RUN $RUN of 3 — $(date -u) ==="
+            echo "=== RUN $RUN of 6 — $(date -u) ==="
             echo "========================================"
             set +e
 
@@ -169,7 +169,7 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "=== SUMMARY: $((3 - FAILS))/3 succeeded ==="
+          echo "=== SUMMARY: $((6 - FAILS))/6 succeeded ==="
           echo "========================================"
 
           if [ $FAILS -gt 0 ]; then
