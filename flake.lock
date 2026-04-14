@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "coldsnap-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776181382,
+        "narHash": "sha256-zukWw8dGdnQN+tvfhX2Qt6Fe9tc8uRU47zZ/JVruJzE=",
+        "owner": "nkk0",
+        "repo": "coldsnap",
+        "rev": "d325ed819dbc566263fa17e1962c39567fbd1f2e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nkk0",
+        "repo": "coldsnap",
+        "rev": "d325ed819dbc566263fa17e1962c39567fbd1f2e",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1775888245,
@@ -15,6 +32,7 @@
     },
     "root": {
       "inputs": {
+        "coldsnap-src": "coldsnap-src",
         "nixpkgs": "nixpkgs",
         "treefmt-nix": "treefmt-nix"
       }

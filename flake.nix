@@ -7,6 +7,11 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # https://github.com/awslabs/coldsnap/pull/438
+    coldsnap-src = {
+      url = "github:nkk0/coldsnap/d325ed819dbc566263fa17e1962c39567fbd1f2e";
+      flake = false;
+    };
   };
 
   outputs =
@@ -14,6 +19,7 @@
       self,
       nixpkgs,
       treefmt-nix,
+      coldsnap-src,
       ...
     }:
     let
@@ -52,6 +58,13 @@
         in
         {
           upload-ami = pkgs.callPackage ./upload-ami { };
+          coldsnap = pkgs.coldsnap.overrideAttrs (old: {
+            src = coldsnap-src;
+            cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+              src = coldsnap-src;
+              hash = "sha256-gCvOhH6r3cJIjmlqHPO/KS68agDT0zeWxSXqxzHtOj8=";
+            };
+          });
         }
       );
       apps = genAttrs supportedSystems (
