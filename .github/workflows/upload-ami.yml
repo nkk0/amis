@@ -1,14 +1,13 @@
-name: Upload Legacy Amazon Image
+name: Upload Amazon Image
 permissions:
   contents: read
 on:
-  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * 0"
 jobs:
   upload-ami:
-    name: Upload Legacy Amazon Image
+    name: Upload Amazon Image
     runs-on: ubuntu-latest
     environment: images
     permissions:
@@ -19,7 +18,6 @@ jobs:
         release:
           - release-25.05
           - release-25.11
-          # - nixos-unstable
         system:
           - x86_64-linux
           - aarch64-linux
@@ -27,9 +25,6 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - uses: DeterminateSystems/nix-installer-action@7993355175c2765e5733dae74f3e0786fe0e5c4f # v12
       - uses: DeterminateSystems/magic-nix-cache-action@87b14cf437d03d37989d87f0fa5ce4f5dc1a330b # v8
-      # NOTE: We download the AMI from Hydra instead of building it ourselves
-      # because aarch64 is currently not supported by AWS EC2 and the legacy
-      # image builder requires nested virtualization.
       - name: Download AMI from Hydra
         id: download_ami
         run: |
@@ -42,19 +37,33 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/upload-ami
           aws-region: ${{ vars.AWS_REGION }}
+      - name: Upload snapshot via coldsnap
+        id: coldsnap
+        run: |
+          image_info='${{ steps.download_ami.outputs.image_info }}'
+          image_file=$(jq -r '.file' < "$image_info")
+          nix shell .#coldsnap nixpkgs#qemu -c bash -c "
+            set -euo pipefail
+            raw_file=\$(mktemp --suffix=.raw)
+            trap 'rm -f \$raw_file' EXIT
+            qemu-img convert -O raw '$image_file' \$raw_file
+            coldsnap upload --workers 64 --client-shards 8 \$raw_file
+          " > /tmp/snapshot_id.txt
+          snapshot_id=$(cat /tmp/snapshot_id.txt | tr -d '[:space:]')
+          echo "snapshot_id=$snapshot_id" >> "$GITHUB_OUTPUT"
+          echo "Snapshot: $snapshot_id"
       - name: Upload Smoke test AMI
         id: upload_smoke_test_ami
         run: |
           image_info='${{ steps.download_ami.outputs.image_info }}'
-          images_bucket='${{ vars.IMAGES_BUCKET }}'
+          snapshot_id='${{ steps.coldsnap.outputs.snapshot_id }}'
           image_ids=$(nix run .#upload-ami -- \
             --image-info "$image_info" \
             --prefix "smoketest/" \
-            --s3-bucket "$images_bucket")
+            --snapshot-id "$snapshot_id")
           echo "image_ids=$image_ids" >> "$GITHUB_OUTPUT"
       - name: Smoke test
         id: smoke_test
-        # NOTE: make sure smoke test isn't cancelled. Such that instance gets cleaned up.
         run: |
           image_ids='${{ steps.upload_smoke_test_ami.outputs.image_ids }}'
           image_id=$(echo "$image_ids" | jq -r '.["${{ vars.AWS_REGION }}"]')
@@ -65,19 +74,15 @@ jobs:
           image_ids='${{ steps.upload_smoke_test_ami.outputs.image_ids }}'
           image_id=$(echo "$image_ids" | jq -r '.["${{ vars.AWS_REGION }}"]')
           nix run .#smoke-test -- --image-id "$image_id" --cancel
-      # NOTE: We do not pass run-id as we're not  building the image ourselves
-      # and we thus need to poll hydra periodically.  Including the run-id would
-      # cause us to register  the same snapshot as an image over and over again
-      # for each run.
       - name: Upload AMIs to all available regions
         if: github.ref == 'refs/heads/main'
         run: |
           image_info='${{ steps.download_ami.outputs.image_info }}'
-          images_bucket='${{ vars.IMAGES_BUCKET }}'
+          snapshot_id='${{ steps.coldsnap.outputs.snapshot_id }}'
           nix run .#upload-ami -- \
             --image-info "$image_info" \
             --prefix "nixos/" \
-            --s3-bucket "$images_bucket" \
+            --snapshot-id "$snapshot_id" \
             --copy-to-regions \
             --best-effort-region me-central-1 \
             --best-effort-region me-south-1 \
