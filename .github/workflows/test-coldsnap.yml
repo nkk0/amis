@@ -89,15 +89,13 @@ jobs:
           echo "S3 upload: ${elapsed}s (~${throughput} MB/s)"
           aws s3 rb "s3://$BUCKET" --force --region us-east-1
 
-      - name: "Coldsnap upload — ${{ matrix.label }}"
-        timeout-minutes: 10
+      - name: "Coldsnap uploads (3 runs) — ${{ matrix.label }}"
+        timeout-minutes: 15
         env:
           AWS_MAX_ATTEMPTS: "1"
           RUST_BACKTRACE: "full"
           RUST_LOG: "coldsnap=info"
         run: |
-          set +e
-
           COLDSNAP=/tmp/coldsnap-patched/target/release/coldsnap
           WORKERS="${{ matrix.workers }}"
           SHARDS="${{ matrix.shards }}"
@@ -112,70 +110,68 @@ jobs:
           fi
 
           echo "=== Config ==="
-          echo "Workers: $WORKERS"
-          echo "Client shards: ${SHARDS:-1 (default)}"
-          echo "Hedge timeout: ${HEDGE:-none}"
+          echo "Workers: $WORKERS | Shards: ${SHARDS:-1} | Hedge: ${HEDGE:-none}"
           echo "Timeouts: read=8s, attempt=15s, operation=90s"
           echo "SDK retries: 1 (disabled), block retries: 4"
           echo "Flags: $FLAGS"
           echo ""
 
-          # Network monitor
-          bash -c 'prev_tx=0; while true; do
-            tx=$(awk "/eth0/ {print \$10}" /proc/net/dev)
-            dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
-            if [ $prev_tx -ne 0 ]; then echo "$(date -u +%H:%M:%S) tx=${dtx}MB/5s"; fi
-            prev_tx=$tx; sleep 5
-          done' > /tmp/net-monitor.log 2>&1 &
-          NET_PID=$!
+          FAILS=0
+          for RUN in 1 2 3; do
+            echo ""
+            echo "========================================"
+            echo "=== RUN $RUN of 3 — $(date -u) ==="
+            echo "========================================"
+            set +e
 
-          echo "=== Starting upload at $(date -u) ==="
-          echo "Command: $COLDSNAP --verbose upload $FLAGS /tmp/nixos-test.raw"
-          start=$SECONDS
+            # Network monitor
+            bash -c 'prev_tx=0; while true; do
+              tx=$(awk "/eth0/ {print \$10}" /proc/net/dev)
+              dtx=$(( (tx - prev_tx) / 1024 / 1024 ))
+              if [ $prev_tx -ne 0 ]; then echo "$(date -u +%H:%M:%S) tx=${dtx}MB/5s"; fi
+              prev_tx=$tx; sleep 5
+            done' > /tmp/net-monitor-$RUN.log 2>&1 &
+            NET_PID=$!
 
-          $COLDSNAP --verbose upload $FLAGS /tmp/nixos-test.raw > /tmp/coldsnap-stdout.log 2>/tmp/coldsnap-stderr.log &
-          CSPID=$!
+            start=$SECONDS
+            $COLDSNAP --verbose upload $FLAGS /tmp/nixos-test.raw > /tmp/coldsnap-stdout-$RUN.log 2>/tmp/coldsnap-stderr-$RUN.log &
+            CSPID=$!
 
-          # Monitor loop
-          while kill -0 $CSPID 2>/dev/null; do
+            while kill -0 $CSPID 2>/dev/null; do
+              elapsed=$(( SECONDS - start ))
+              conns=$(ss -tn state established 2>/dev/null | grep -c "443" || echo "0")
+              net_line=$(tail -1 /tmp/net-monitor-$RUN.log 2>/dev/null || echo "n/a")
+              echo "  [${elapsed}s] conns=$conns | $net_line"
+              sleep 10
+            done
+
+            wait $CSPID
+            STATUS=$?
             elapsed=$(( SECONDS - start ))
-            conns=$(ss -tn state established 2>/dev/null | grep -c "443" || echo "0")
-            net_line=$(tail -1 /tmp/net-monitor.log 2>/dev/null || echo "n/a")
-            stderr_lines=$(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo "0")
-            echo "[$(date -u +%H:%M:%S)] ${elapsed}s | conns=$conns | stderr=$stderr_lines | $net_line"
-            sleep 10
+            kill $NET_PID 2>/dev/null || true
+
+            if [ $STATUS -eq 0 ]; then
+              snap_id=$(cat /tmp/coldsnap-stdout-$RUN.log | tr -d '[:space:]')
+              raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
+              throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
+              echo "--- RUN $RUN: OK | ${elapsed}s | ~${throughput} MB/s | $snap_id"
+              aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
+            else
+              echo "--- RUN $RUN: FAILED (exit $STATUS) | ${elapsed}s"
+              FAILS=$(( FAILS + 1 ))
+            fi
+
+            echo "--- STDERR (run $RUN):"
+            cat /tmp/coldsnap-stderr-$RUN.log 2>/dev/null || echo "(empty)"
+            echo "--- Network (run $RUN):"
+            cat /tmp/net-monitor-$RUN.log 2>/dev/null || echo "(empty)"
           done
 
-          wait $CSPID
-          STATUS=$?
-          elapsed=$(( SECONDS - start ))
-          kill $NET_PID 2>/dev/null || true
-
           echo ""
-          echo "============================================"
-          echo "EXIT CODE: $STATUS"
-          echo "WALL TIME: ${elapsed}s"
-          if [ $STATUS -eq 0 ]; then
-            snap_id=$(cat /tmp/coldsnap-stdout.log | tr -d '[:space:]')
-            raw_bytes=$(stat -c%s /tmp/nixos-test.raw)
-            throughput=$(( raw_bytes / elapsed / 1024 / 1024 ))
-            echo "Throughput: ~${throughput} MB/s"
-            echo "Snapshot: $snap_id"
+          echo "========================================"
+          echo "=== SUMMARY: $((3 - FAILS))/3 succeeded ==="
+          echo "========================================"
+
+          if [ $FAILS -gt 0 ]; then
+            exit 1
           fi
-          echo "============================================"
-          echo ""
-          echo "=== STDOUT ==="
-          cat /tmp/coldsnap-stdout.log 2>/dev/null || echo "(empty)"
-          echo ""
-          echo "=== STDERR (full — includes histogram) ==="
-          cat /tmp/coldsnap-stderr.log 2>/dev/null || echo "(empty)"
-          echo "($(wc -l < /tmp/coldsnap-stderr.log 2>/dev/null || echo 0) total lines)"
-          echo ""
-          echo "=== Network throughput log ==="
-          cat /tmp/net-monitor.log 2>/dev/null || echo "(empty)"
-
-          if [ $STATUS -eq 0 ] && [ -n "$snap_id" ]; then
-            aws ec2 delete-snapshot --snapshot-id "$snap_id" 2>/dev/null || true
-          fi
-
-          exit $STATUS
