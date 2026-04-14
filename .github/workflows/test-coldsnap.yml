@@ -14,19 +14,12 @@ jobs:
           - label: "32w, 1 client (control)"
             workers: "32"
             shards: ""
-            hedge: ""
           - label: "64w, 1 client"
             workers: "64"
             shards: ""
-            hedge: ""
           - label: "64w, 8 shards"
             workers: "64"
             shards: "8"
-            hedge: ""
-          - label: "64w, 8 shards, hedge@2s"
-            workers: "64"
-            shards: "8"
-            hedge: "2"
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - uses: DeterminateSystems/nix-installer-action@7993355175c2765e5733dae74f3e0786fe0e5c4f # v12
@@ -44,21 +37,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: us-east-1
-      - name: Build patched coldsnap
+      - name: Build coldsnap from fork
         run: |
           echo "::group::Installing Rust toolchain and deps"
           nix profile install nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl nixpkgs#qemu
           echo "::endgroup::"
-          echo "::group::Cloning and patching coldsnap"
-          git clone --depth 1 https://github.com/awslabs/coldsnap.git /tmp/coldsnap-patched
-          cd /tmp/coldsnap-patched
-          git apply "$GITHUB_WORKSPACE/coldsnap-v5.patch"
+          echo "::group::Cloning coldsnap (unified branch)"
+          git clone --depth 1 --branch unified https://github.com/nkk0/coldsnap.git /tmp/coldsnap
           echo "::endgroup::"
           echo "::group::Building coldsnap"
-          cargo build --release 2>&1
+          cd /tmp/coldsnap && cargo build --release 2>&1
           echo "::endgroup::"
-          echo "Patched coldsnap built successfully"
-          /tmp/coldsnap-patched/target/release/coldsnap upload --help
+          /tmp/coldsnap/target/release/coldsnap upload --help
       - name: Convert VHD to raw
         run: |
           image_file=$(jq -r '.file' < '${{ steps.download_ami.outputs.image_info }}')
@@ -89,30 +79,26 @@ jobs:
           echo "S3 upload: ${elapsed}s (~${throughput} MB/s)"
           aws s3 rb "s3://$BUCKET" --force --region us-east-1
 
-      - name: "Coldsnap uploads (3 runs) — ${{ matrix.label }}"
+      - name: "Coldsnap uploads (6 runs) — ${{ matrix.label }}"
         timeout-minutes: 25
         env:
           AWS_MAX_ATTEMPTS: "1"
           RUST_BACKTRACE: "full"
           RUST_LOG: "coldsnap=info"
         run: |
-          COLDSNAP=/tmp/coldsnap-patched/target/release/coldsnap
+          COLDSNAP=/tmp/coldsnap/target/release/coldsnap
           WORKERS="${{ matrix.workers }}"
           SHARDS="${{ matrix.shards }}"
-          HEDGE="${{ matrix.hedge }}"
 
           FLAGS="--workers $WORKERS"
           if [ -n "$SHARDS" ]; then
             FLAGS="$FLAGS --client-shards $SHARDS"
           fi
-          if [ -n "$HEDGE" ]; then
-            FLAGS="$FLAGS --hedge-timeout $HEDGE"
-          fi
 
           echo "=== Config ==="
-          echo "Workers: $WORKERS | Shards: ${SHARDS:-1} | Hedge: ${HEDGE:-none}"
-          echo "Timeouts: read=8s, attempt=15s, operation=90s"
-          echo "SDK retries: 1 (disabled), block retries: 4"
+          echo "Workers: $WORKERS | Shards: ${SHARDS:-1}"
+          echo "Timeouts: read=12s, attempt=20s, operation=120s"
+          echo "SDK retries: 1 (disabled), block retries: 5"
           echo "Flags: $FLAGS"
           echo ""
 
